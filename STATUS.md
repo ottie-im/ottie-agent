@@ -47,18 +47,33 @@
 - 18/18 通过（2026-04-08 验证）
 - 测试文件：packages/adapter/src/__tests__/adapter.test.ts
 
-## 下一步
+## 下一步：Phase 4 — 设备感知
 
-### 近期
-- [ ] 验证接收方决策卡片在桌面端 UI 的真实触发
-- [ ] 验证 LLM detectIntent 的实际效果
+详细计划见 `docs/phase4-plan.md`
 
-### Phase 4 — 设备感知
-- [ ] packages/screen/：接入 Screenpipe SDK
-- [ ] skill-gui-detect：GUI 弹窗识别
-- [ ] skill-cli-watch：CLI 变动监听
-- [ ] skill-dispatch：设备调度
-- [ ] 记忆上报
+### Step 4.1 — packages/screen/（OttieScreen 类）
+- [ ] OttieScreen.ts：封装 Screenpipe REST API（localhost:3030）
+- [ ] patterns.ts：GUI/CLI 检测 pattern 定义
+- [ ] 健康检查 + 轮询 + 事件比对
+- [ ] 验证：Screenpipe 运行时能检测到屏幕内容
+
+### Step 4.2 — GUI/CLI 检测 Skills
+- [ ] skill-gui-detect：权限框/确认框/错误框检测
+- [ ] skill-cli-watch：Y/n、Allow?、Password 等 CLI 提示检测
+- [ ] 验证：弹出权限框时触发事件
+
+### Step 4.3 — 记忆上报
+- [ ] 屏幕事件 → OttieMemory.observe()
+- [ ] 通过 onNotification 回调推送到 IM 层
+
+### Step 4.4 — 桌面端集成（在 ottie 主仓库）
+- [ ] OpenClawAdapter 启动 OttieScreen
+- [ ] 桌面端显示屏幕通知卡片
+- [ ] Tauri 安装包集成 Screenpipe
+
+### 依赖的开源项目
+- Screenpipe: https://github.com/mediar-ai/screenpipe（MIT，REST API）
+- OpenClaw: https://github.com/openclaw/openclaw（参考设计，不直接依赖）
 
 ### Phase 5 — 补充 Skills + 改写升级
 - [ ] skill-persona：对外人格控制
