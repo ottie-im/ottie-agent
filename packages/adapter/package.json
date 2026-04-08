@@ -5,7 +5,8 @@
   "dependencies": {
     "@ottie-im/contracts": "file:../../../ottie/packages/contracts",
     "@ottie-im/skills": "*",
-    "@ottie-im/memory": "*"
+    "@ottie-im/memory": "*",
+    "openai": "^4.80.0"
   },
   "devDependencies": {
     "vitest": "^4.1.3"

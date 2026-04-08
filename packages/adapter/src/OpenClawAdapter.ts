@@ -1,9 +1,10 @@
 /**
  * OpenClawAdapter — OttieAgentAdapter 的默认实现
  *
- * 当前是纯 TypeScript 实现，用 skill-rewrite + skill-approve 组合。
- * 后续可以替换成真正的 OpenClaw 框架。
+ * 发送方：用户输入 → LLM/规则改写 → 审批 → 发出
+ * 接收方：收到消息 → LLM/规则意图识别 → 决策卡片 → 用户选择 → 生成回复
  *
+ * LLM 配置后用 LLM，不配置降级到规则引擎。
  * 验证标准：把这个适配器换成 mock，Ottie IM 代码零修改仍能跑。
  */
 
@@ -14,10 +15,12 @@ import type {
   ApprovalRequest,
   ApprovalDecision,
   OttieScreenEvent,
-  OttieDevice,
   MemoryIndex,
   MemoryEntry,
   Unsubscribe,
+  DetectedIntent,
+  DecisionRequest,
+  SuggestedAction,
 } from '@ottie-im/contracts'
 
 import { rewrite } from '@ottie-im/skills'
@@ -28,7 +31,99 @@ export interface OpenClawAdapterConfig {
   name?: string
   persona?: string
   memoryPath?: string
+  llm?: { baseUrl: string; apiKey: string; model: string }
 }
+
+// ---- LLM helpers ----
+
+let llmClient: any = null
+let llmModel = ''
+
+async function llmChat(
+  messages: { role: string; content: string }[],
+  opts?: { temperature?: number; max_tokens?: number }
+): Promise<string> {
+  if (!llmClient) return ''
+  const resp = await llmClient.chat.completions.create({
+    model: llmModel,
+    messages,
+    temperature: opts?.temperature ?? 0.7,
+    max_tokens: opts?.max_tokens ?? 500,
+  })
+  return resp.choices[0]?.message?.content ?? ''
+}
+
+async function llmRewrite(intent: string, persona: string): Promise<string> {
+  return llmChat([
+    { role: 'system', content: `你是 Ottie，AI IM 秘书。把用户的口语化指令改写成适合发送给对方的得体消息。
+规则：保持原始意图，提取指令中真正要发的内容（如"帮我问他..."→去掉前缀），语言跟随用户，简洁自然。只输出改写后的消息。
+你的对外人格：${persona}` },
+    { role: 'user', content: intent },
+  ], { temperature: 0.6, max_tokens: 200 })
+}
+
+async function llmDetectIntent(message: string, senderName?: string): Promise<DetectedIntent> {
+  const raw = await llmChat([
+    { role: 'system', content: `分析收到的消息，判断意图并给出建议回复选项。
+输出严格 JSON：{"type":"invitation|question|request|info|greeting|general","summary":"一句话总结","suggestedActions":[{"label":"按钮文字2-4字","response":"点击后的回复"}]}
+- suggestedActions 最多 3 个，第一个是正面回应
+- 回复自然得体${senderName ? `\n发送者：${senderName}` : ''}` },
+    { role: 'user', content: message },
+  ], { temperature: 0.3, max_tokens: 300 })
+
+  try {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/)
+    if (jsonMatch) return JSON.parse(jsonMatch[0])
+  } catch {}
+  return ruleDetectIntent(message)
+}
+
+async function llmComposeReply(originalMessage: string, userChoice: string): Promise<string> {
+  return llmChat([
+    { role: 'system', content: '根据用户的选择生成一条得体的回复。简洁自然，只输出回复内容。' },
+    { role: 'user', content: `收到的消息：${originalMessage}\n我的选择：${userChoice}\n请生成回复：` },
+  ], { temperature: 0.6, max_tokens: 150 })
+}
+
+// ---- Rule-based fallbacks ----
+
+const COMMAND_PATTERNS = [
+  { pattern: /^(帮我|替我|跟他|跟她|告诉他|告诉她|问他|问她|和他说|和她说|跟他说|跟她说)(.+)/, extract: 2 },
+  { pattern: /^(tell him|tell her|ask him|ask her|let him know|let her know)\s+(.+)/i, extract: 2 },
+]
+
+function ruleRewrite(intent: string): string {
+  let text = intent.trim()
+  for (const { pattern, extract } of COMMAND_PATTERNS) {
+    const match = text.match(pattern)
+    if (match && match[extract]) { text = match[extract].trim(); break }
+  }
+  if (text && !/[。？！.?!]$/.test(text)) {
+    text += /吗|呢|么|嘛|不$|没$|\?/.test(text) ? '？' : '。'
+  }
+  if (/^[a-z]/.test(text)) text = text.charAt(0).toUpperCase() + text.slice(1)
+  return text
+}
+
+function ruleDetectIntent(message: string): DetectedIntent {
+  const m = message.toLowerCase()
+  if (/吃饭|聚餐|约|一起去|周[一二三四五六日末]/.test(m))
+    return { type: 'invitation', summary: '邀请你一起活动', suggestedActions: [
+      { label: '好的', response: '好的呀！' }, { label: '没空', response: '不好意思，没空呢。' }] }
+  if (/吗|呢|么|？|\?|怎么|什么|哪|多少|几/.test(m))
+    return { type: 'question', summary: '向你提问', suggestedActions: [
+      { label: '好的', response: '好的。' }, { label: '不行', response: '不太方便。' }] }
+  if (/帮|麻烦|请|能不能|可以/.test(m))
+    return { type: 'request', summary: '请你帮忙', suggestedActions: [
+      { label: '没问题', response: '没问题！' }, { label: '不方便', response: '不太方便，抱歉。' }] }
+  if (/你好|嗨|hi|hello|hey/.test(m))
+    return { type: 'greeting', summary: '跟你打招呼', suggestedActions: [
+      { label: '你好', response: '你好！' }] }
+  return { type: 'general', summary: message.slice(0, 30), suggestedActions: [
+    { label: '收到', response: '收到。' }, { label: '好的', response: '好的。' }] }
+}
+
+// ---- Adapter ----
 
 export class OpenClawAdapter implements OttieAgentAdapter {
   id: string
@@ -38,9 +133,10 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   private approvalManager: ReturnType<typeof createApprovalManager>
   private memory: OttieMemory
   private status: 'running' | 'stopped' | 'error' = 'stopped'
+  private llmEnabled = false
 
-  // Callbacks
   private draftCallbacks: Set<(draft: ApprovalRequest) => void> = new Set()
+  private decisionCallbacks: Set<(decision: DecisionRequest) => void> = new Set()
   private notificationCallbacks: Set<(event: OttieScreenEvent) => void> = new Set()
 
   constructor(config: OpenClawAdapterConfig = {}) {
@@ -49,51 +145,107 @@ export class OpenClawAdapter implements OttieAgentAdapter {
     this.persona = config.persona ?? '友好、得体、简洁'
     this.approvalManager = createApprovalManager()
     this.memory = new OttieMemory(config.memoryPath ?? './MEMORY.md')
+    if (config.llm) this.configureLLM(config.llm)
   }
 
   // ============================================================
-  // 基本信息
+  // LLM 配置
   // ============================================================
+
+  configureLLM(config: { baseUrl: string; apiKey: string; model: string }): void {
+    // Dynamic import to avoid bundling openai in non-LLM builds
+    import('openai').then(({ default: OpenAI }) => {
+      llmClient = new OpenAI({
+        baseURL: config.baseUrl,
+        apiKey: config.apiKey,
+        dangerouslyAllowBrowser: true,
+      })
+      llmModel = config.model
+      this.llmEnabled = true
+      console.log(`🦦 Agent LLM: ${config.model} via ${config.baseUrl}`)
+    }).catch(() => {
+      console.warn('🦦 OpenAI SDK not available, using rule engine')
+    })
+  }
 
   getAgentCard(): AgentCard {
     return {
       name: this.name,
-      capabilities: ['中文', '英文', '消息改写', '审批'],
+      capabilities: ['中文', '英文', '消息改写', '审批', '意图识别'],
       persona: this.persona,
     }
   }
 
   // ============================================================
-  // IM → Agent: 收到消息
+  // 发送方：用户输入 → 改写 → 审批
   // ============================================================
 
   async onMessage(msg: OttieMessage): Promise<void> {
-    // 当 IM 层传来用户输入时，执行改写 → 审批流程
     if (msg.content.type !== 'text') return
-
     const intent = msg.content.body
 
-    // Step 1: 改写
-    const result = rewrite({
-      intent,
-      persona: this.persona,
-    })
-
-    // Step 2: 创建审批请求
-    const request = this.approvalManager.createRequest(
-      result.rewritten,
-      intent,
-      msg.roomId,
-    )
-
-    // Step 3: 通知 IM 层有新的审批请求
-    for (const cb of this.draftCallbacks) {
-      cb(request)
+    let rewritten: string
+    if (this.llmEnabled) {
+      try {
+        rewritten = await llmRewrite(intent, this.persona)
+      } catch {
+        rewritten = ruleRewrite(intent)
+      }
+    } else {
+      const result = rewrite({ intent, persona: this.persona })
+      rewritten = result.rewritten
     }
+
+    const request = this.approvalManager.createRequest(rewritten, intent, msg.roomId)
+    for (const cb of this.draftCallbacks) cb(request)
   }
 
   // ============================================================
-  // Agent → IM: 拟好消息推给用户审批
+  // 接收方：收到对方消息 → 意图识别 → 决策
+  // ============================================================
+
+  async onIncomingMessage(msg: OttieMessage, senderName: string): Promise<void> {
+    if (msg.content.type !== 'text') return
+    const body = msg.content.body
+
+    let intent: DetectedIntent
+    if (this.llmEnabled) {
+      try {
+        intent = await llmDetectIntent(body, senderName)
+      } catch {
+        intent = ruleDetectIntent(body)
+      }
+    } else {
+      intent = ruleDetectIntent(body)
+    }
+
+    const decision: DecisionRequest = {
+      messageId: msg.id,
+      roomId: msg.roomId,
+      senderName,
+      originalMessage: body,
+      intent,
+    }
+    for (const cb of this.decisionCallbacks) cb(decision)
+  }
+
+  // ============================================================
+  // 接收方：用户选择决策动作 → 生成回复
+  // ============================================================
+
+  async onDecisionAction(originalMessage: string, chosenAction: SuggestedAction): Promise<string> {
+    if (this.llmEnabled) {
+      try {
+        return await llmComposeReply(originalMessage, chosenAction.response)
+      } catch {
+        return chosenAction.response
+      }
+    }
+    return chosenAction.response
+  }
+
+  // ============================================================
+  // 回调注册
   // ============================================================
 
   onDraft(callback: (draft: ApprovalRequest) => void): Unsubscribe {
@@ -101,30 +253,25 @@ export class OpenClawAdapter implements OttieAgentAdapter {
     return () => this.draftCallbacks.delete(callback)
   }
 
-  // ============================================================
-  // IM → Agent: 用户审批结果
-  // ============================================================
+  onDecision(callback: (decision: DecisionRequest) => void): Unsubscribe {
+    this.decisionCallbacks.add(callback)
+    return () => this.decisionCallbacks.delete(callback)
+  }
 
-  async onApproval(requestId: string, decision: ApprovalDecision): Promise<OttieMessage | null> {
+  onApproval(requestId: string, decision: ApprovalDecision): Promise<OttieMessage | null> {
     const result = this.approvalManager.processDecision(requestId, decision)
-
     if (result.action === 'send' && result.content && result.targetRoom) {
-      return {
+      return Promise.resolve({
         id: `msg_${Date.now()}`,
         roomId: result.targetRoom,
-        senderId: '', // IM 层填充
+        senderId: '',
         timestamp: Date.now(),
         type: 'text',
         content: result.content,
-      }
+      })
     }
-
-    return null
+    return Promise.resolve(null)
   }
-
-  // ============================================================
-  // Agent → IM: 通知推送
-  // ============================================================
 
   onNotification(callback: (event: OttieScreenEvent) => void): Unsubscribe {
     this.notificationCallbacks.add(callback)
@@ -132,31 +279,12 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   }
 
   // ============================================================
-  // 记忆
+  // 记忆 + 生命周期
   // ============================================================
 
-  async getMemory(): Promise<MemoryIndex> {
-    return this.memory.load()
-  }
-
-  async queryMemory(query: string): Promise<MemoryEntry[]> {
-    return this.memory.query(query)
-  }
-
-  // ============================================================
-  // 生命周期
-  // ============================================================
-
-  async start(): Promise<void> {
-    await this.memory.load()
-    this.status = 'running'
-  }
-
-  async stop(): Promise<void> {
-    this.status = 'stopped'
-  }
-
-  getStatus(): 'running' | 'stopped' | 'error' {
-    return this.status
-  }
+  async getMemory(): Promise<MemoryIndex> { return this.memory.load() }
+  async queryMemory(query: string): Promise<MemoryEntry[]> { return this.memory.query(query) }
+  async start(): Promise<void> { await this.memory.load(); this.status = 'running' }
+  async stop(): Promise<void> { this.status = 'stopped' }
+  getStatus(): 'running' | 'stopped' | 'error' { return this.status }
 }
