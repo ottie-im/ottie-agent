@@ -1,0 +1,1 @@
+export { OttieMemory } from './OttieMemory'

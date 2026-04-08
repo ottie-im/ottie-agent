@@ -1,0 +1,15 @@
+{
+  "name": "@ottie-im/skills",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@ottie-im/contracts": "file:../../../ottie/packages/contracts"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.3"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  }
+}
