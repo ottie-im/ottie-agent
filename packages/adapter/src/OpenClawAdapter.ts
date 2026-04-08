@@ -45,6 +45,7 @@ try {
 export interface OpenClawAdapterConfig {
   name?: string
   persona?: string
+  soulPath?: string     // SOUL.md 文件路径（Node 环境用）
   memoryPath?: string
   llm?: { baseUrl: string; apiKey: string; model: string }
   enableScreen?: boolean // 是否启用屏幕感知（默认 false）
