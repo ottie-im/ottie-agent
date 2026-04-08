@@ -23,16 +23,23 @@ import type {
   SuggestedAction,
 } from '@ottie-im/contracts'
 
-import { rewrite } from '@ottie-im/skills'
+import { rewrite, analyzeGUIPopup, analyzeCLIPrompt } from '@ottie-im/skills'
 import { createApprovalManager } from '@ottie-im/skills'
 
 // Memory is optional — uses fs on Node, skipped in browser
 let OttieMemory: any = null
 try {
-  // Dynamic require avoids browser bundling fs/promises
   OttieMemory = require('@ottie-im/memory').OttieMemory
 } catch {
   // Browser environment — memory not available
+}
+
+// Screen is optional — only available on desktop (not browser)
+let OttieScreenClass: any = null
+try {
+  OttieScreenClass = require('@ottie-im/screen').OttieScreen
+} catch {
+  // Browser environment or screenpipe not installed
 }
 
 export interface OpenClawAdapterConfig {
@@ -40,6 +47,7 @@ export interface OpenClawAdapterConfig {
   persona?: string
   memoryPath?: string
   llm?: { baseUrl: string; apiKey: string; model: string }
+  enableScreen?: boolean // 是否启用屏幕感知（默认 false）
 }
 
 // ---- LLM helpers ----
@@ -140,8 +148,10 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   private persona: string
   private approvalManager: ReturnType<typeof createApprovalManager>
   private memory: any
+  private screen: any = null
   private status: 'running' | 'stopped' | 'error' = 'stopped'
   private llmEnabled = false
+  private enableScreen: boolean
 
   private draftCallbacks: Set<(draft: ApprovalRequest) => void> = new Set()
   private decisionCallbacks: Set<(decision: DecisionRequest) => void> = new Set()
@@ -153,6 +163,7 @@ export class OpenClawAdapter implements OttieAgentAdapter {
     this.persona = config.persona ?? '友好、得体、简洁'
     this.approvalManager = createApprovalManager()
     this.memory = OttieMemory ? new OttieMemory(config.memoryPath ?? './MEMORY.md') : null
+    this.enableScreen = config.enableScreen ?? false
     if (config.llm) this.configureLLM(config.llm)
   }
 
@@ -292,7 +303,44 @@ export class OpenClawAdapter implements OttieAgentAdapter {
 
   async getMemory(): Promise<MemoryIndex> { return this.memory?.load() ?? { entries: [], lastDream: 0, version: 1 } }
   async queryMemory(query: string): Promise<MemoryEntry[]> { return this.memory?.query(query) ?? [] }
-  async start(): Promise<void> { if (this.memory) await this.memory.load(); this.status = 'running' }
-  async stop(): Promise<void> { this.status = 'stopped' }
+
+  async start(): Promise<void> {
+    if (this.memory) await this.memory.load()
+
+    // Start screen sensing if enabled and available
+    if (this.enableScreen && OttieScreenClass) {
+      this.screen = new OttieScreenClass()
+      this.screen.onEvent((event: OttieScreenEvent) => {
+        // Analyze the event using skills
+        let summary = event.content.slice(0, 100)
+        if (event.type === 'gui-popup') {
+          const result = analyzeGUIPopup(event)
+          summary = result.summary
+        } else if (event.type === 'cli-prompt') {
+          const result = analyzeCLIPrompt(event)
+          summary = result.summary
+        }
+
+        // Write to memory
+        if (this.memory) {
+          this.memory.observe(event, this.id).catch(() => {})
+        }
+
+        // Push notification to IM layer
+        for (const cb of this.notificationCallbacks) {
+          try { cb({ ...event, content: summary }) } catch {}
+        }
+      })
+      await this.screen.start()
+    }
+
+    this.status = 'running'
+  }
+
+  async stop(): Promise<void> {
+    if (this.screen) { this.screen.stop(); this.screen = null }
+    this.status = 'stopped'
+  }
+
   getStatus(): 'running' | 'stopped' | 'error' { return this.status }
 }

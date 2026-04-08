@@ -6,6 +6,7 @@
     "@ottie-im/contracts": "file:../../../ottie/packages/contracts",
     "@ottie-im/skills": "*",
     "@ottie-im/memory": "*",
+    "@ottie-im/screen": "*",
     "openai": "^4.80.0"
   },
   "devDependencies": {
