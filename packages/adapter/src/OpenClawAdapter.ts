@@ -25,7 +25,15 @@ import type {
 
 import { rewrite } from '@ottie-im/skills'
 import { createApprovalManager } from '@ottie-im/skills'
-import { OttieMemory } from '@ottie-im/memory'
+
+// Memory is optional — uses fs on Node, skipped in browser
+let OttieMemory: any = null
+try {
+  // Dynamic require avoids browser bundling fs/promises
+  OttieMemory = require('@ottie-im/memory').OttieMemory
+} catch {
+  // Browser environment — memory not available
+}
 
 export interface OpenClawAdapterConfig {
   name?: string
@@ -131,7 +139,7 @@ export class OpenClawAdapter implements OttieAgentAdapter {
 
   private persona: string
   private approvalManager: ReturnType<typeof createApprovalManager>
-  private memory: OttieMemory
+  private memory: any
   private status: 'running' | 'stopped' | 'error' = 'stopped'
   private llmEnabled = false
 
@@ -144,7 +152,7 @@ export class OpenClawAdapter implements OttieAgentAdapter {
     this.name = config.name ?? 'Ottie'
     this.persona = config.persona ?? '友好、得体、简洁'
     this.approvalManager = createApprovalManager()
-    this.memory = new OttieMemory(config.memoryPath ?? './MEMORY.md')
+    this.memory = OttieMemory ? new OttieMemory(config.memoryPath ?? './MEMORY.md') : null
     if (config.llm) this.configureLLM(config.llm)
   }
 
@@ -282,9 +290,9 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   // 记忆 + 生命周期
   // ============================================================
 
-  async getMemory(): Promise<MemoryIndex> { return this.memory.load() }
-  async queryMemory(query: string): Promise<MemoryEntry[]> { return this.memory.query(query) }
-  async start(): Promise<void> { await this.memory.load(); this.status = 'running' }
+  async getMemory(): Promise<MemoryIndex> { return this.memory?.load() ?? { entries: [], lastDream: 0, version: 1 } }
+  async queryMemory(query: string): Promise<MemoryEntry[]> { return this.memory?.query(query) ?? [] }
+  async start(): Promise<void> { if (this.memory) await this.memory.load(); this.status = 'running' }
   async stop(): Promise<void> { this.status = 'stopped' }
   getStatus(): 'running' | 'stopped' | 'error' { return this.status }
 }
