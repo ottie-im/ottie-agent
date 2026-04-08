@@ -18,10 +18,10 @@
 | packages/skills/ — persona | ✅ | 对外人格控制 + 边界检查 |
 | packages/skills/ — delegate | ✅ | 信任委托规则引擎 |
 | packages/skills/ — duty | ✅ | 值班模式（自动回复 + 时间段） |
-| packages/skills/ — dispatch | ⬜ | 设备调度（后续） |
-| packages/skills/ — ota | ⬜ | OTA 更新检测（后续） |
+| packages/skills/ — dispatch | ✅ | 设备调度（选设备 + 解析指令） |
+| packages/skills/ — ota | ✅ | OTA 更新检测（Ollama 模型 + 定期检查） |
 
-**Skills 完成度：7/9**
+**Skills 完成度：9/9 ✅ 全部完成**
 **测试：18/18 通过（adapter 接口测试）**
 
 ## 参考的开源项目
