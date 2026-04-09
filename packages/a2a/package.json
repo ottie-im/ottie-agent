@@ -1,0 +1,10 @@
+{
+  "name": "@ottie-im/agent-a2a",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "description": "A2A protocol adapter for Ottie — enables third-party Agent interop",
+  "dependencies": {
+    "@ottie-im/contracts": "file:../../../ottie/packages/contracts"
+  },
+  "scripts": { "build": "tsc", "test": "vitest run" }
+}
