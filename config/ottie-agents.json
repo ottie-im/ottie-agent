@@ -1,0 +1,55 @@
+{
+  "_comment": "Ottie 双 Agent 配置（个人 Agent + 设备 Agent）",
+  "_comment2": "TODO: 临时域名 ottie.claws.company，最终改为 ottie 正式域名",
+
+  "agents": [
+    {
+      "id": "personal",
+      "name": "Ottie（个人秘书）",
+      "type": "personal",
+      "soul": "../SOUL.md",
+      "memory": "./data/personal/MEMORY.md",
+      "skills": [
+        "skill-rewrite",
+        "skill-approve",
+        "skill-persona",
+        "skill-delegate",
+        "skill-duty",
+        "skill-ota"
+      ],
+      "llm": {
+        "_comment": "通过环境变量配置，支持 Claude/GPT/Ollama",
+        "baseUrl": "${LLM_BASE_URL:-https://aihubmix.com/v1}",
+        "model": "${LLM_MODEL:-claude-sonnet-4-20250514}"
+      }
+    },
+    {
+      "id": "device",
+      "name": "Ottie（设备感知）",
+      "type": "device",
+      "soul": "./config/device-soul.md",
+      "memory": "./data/device/MEMORY.md",
+      "skills": [
+        "skill-gui-detect",
+        "skill-cli-watch",
+        "skill-dispatch"
+      ],
+      "screen": {
+        "enabled": true,
+        "screenpipeUrl": "http://localhost:3030",
+        "pollInterval": 2000
+      },
+      "llm": {
+        "_comment": "设备 Agent 用轻量模型",
+        "baseUrl": "${LLM_BASE_URL:-http://localhost:11434/v1}",
+        "model": "${DEVICE_LLM_MODEL:-gemma2:9b}"
+      }
+    }
+  ],
+
+  "communication": {
+    "_comment": "个人 Agent 和设备 Agent 通过 adapter 内部消息通信",
+    "method": "internal",
+    "fallback": "matrix"
+  }
+}

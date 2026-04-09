@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+data/personal/MEMORY.md
+data/device/MEMORY.md
