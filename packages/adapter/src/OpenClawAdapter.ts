@@ -204,10 +204,22 @@ export class OpenClawAdapter implements OttieAgentAdapter {
     if (msg.content.type !== 'text') return
     const intent = msg.content.body
 
+    // Load memory context for LLM rewrite (checklist #151)
+    let memoryContext = ''
+    if (this.memory) {
+      try {
+        const relevant = await this.memory.query(intent)
+        if (relevant.length > 0) {
+          memoryContext = relevant.slice(0, 3).map((e: any) => e.content).join('; ')
+        }
+      } catch {}
+    }
+
     let rewritten: string
     if (this.llmEnabled) {
       try {
-        rewritten = await llmRewrite(intent, this.persona)
+        const personaWithMemory = this.persona + (memoryContext ? '\n记忆参考：' + memoryContext : '')
+        rewritten = await llmRewrite(intent, personaWithMemory)
       } catch {
         rewritten = ruleRewrite(intent)
       }
