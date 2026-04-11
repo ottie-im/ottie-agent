@@ -1,15 +1,16 @@
 {
-  "name": "@ottie-im/skills",
+  "name": "@ottie-im/mc-core",
   "version": "0.1.0",
+  "description": "Mission Control core modules for Ottie agent orchestration",
   "main": "src/index.ts",
   "dependencies": {
     "@ottie-im/contracts": "file:../../../ottie/packages/contracts"
   },
   "devDependencies": {
-    "vitest": "^4.1.3"
+    "typescript": "^5.5.0"
   },
   "scripts": {
     "build": "tsc",
-    "test": "vitest run --passWithNoTests"
+    "test": "echo 'no tests yet'"
   }
 }

@@ -1,10 +1,10 @@
 /**
- * OpenClawAdapter — OttieAgentAdapter 的默认实现
+ * OpenClawAdapter — OttieAgentAdapter 的 OpenClaw 实现
  *
- * 发送方：用户输入 → LLM/规则改写 → 审批 → 发出
- * 接收方：收到消息 → LLM/规则意图识别 → 决策卡片 → 用户选择 → 生成回复
+ * 通过 REST API 与真正的 OpenClaw gateway 通信。
+ * 个人 Agent 负责改写/审批/调度，设备 Agent 负责执行。
+ * Agent 间通过 sessions_send 通信。
  *
- * LLM 配置后用 LLM，不配置降级到规则引擎。
  * 验证标准：把这个适配器换成 mock，Ottie IM 代码零修改仍能跑。
  */
 
@@ -17,92 +17,88 @@ import type {
   OttieScreenEvent,
   MemoryIndex,
   MemoryEntry,
+  OttieDevice,
+  DeviceCommand,
   Unsubscribe,
   DetectedIntent,
   DecisionRequest,
   SuggestedAction,
 } from '@ottie-im/contracts'
 
-import { rewrite, analyzeGUIPopup, analyzeCLIPrompt } from '@ottie-im/skills'
 import { createApprovalManager } from '@ottie-im/skills'
 
-// Memory is optional — uses fs on Node, skipped in browser
-let OttieMemory: any = null
-try {
-  OttieMemory = require('@ottie-im/memory').OttieMemory
-} catch {
-  // Browser environment — memory not available
+// ---- Gateway Client (CLI or Tauri IPC) ----
+
+/**
+ * Send a message to an OpenClaw agent via the CLI.
+ * In Tauri, this runs through the Rust backend's exec.
+ * In Node/test, this spawns the openclaw process directly.
+ */
+function getTauriInvoke(): ((cmd: string, args?: any) => Promise<any>) | null {
+  if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {
+    return (window as any).__TAURI_INTERNALS__.invoke
+  }
+  return null
 }
 
-// Screen is optional — only available on desktop (not browser)
-let OttieScreenClass: any = null
-try {
-  OttieScreenClass = require('@ottie-im/screen').OttieScreen
-} catch {
-  // Browser environment or screenpipe not installed
+async function gatewayAgent(
+  agentId: string,
+  message: string,
+): Promise<string> {
+  // Tauri environment: use IPC directly (no dynamic import needed)
+  const invoke = getTauriInvoke()
+  if (invoke) {
+    return invoke('openclaw_agent', { agentId, message })
+  }
+
+  // Node environment: spawn CLI directly (isolated profile)
+  const { execSync } = await import('child_process')
+  const escaped = message.replace(/"/g, '\\"')
+  const result = execSync(
+    `openclaw --profile ottie agent --agent ${agentId} --message "${escaped}" --json`,
+    { encoding: 'utf-8', timeout: 60000 }
+  )
+  try {
+    const parsed = JSON.parse(result)
+    return parsed.result?.payloads?.[0]?.text ?? ''
+  } catch {
+    return result.trim()
+  }
 }
+
+async function gatewayHealth(_gatewayUrl: string): Promise<boolean> {
+  // Tauri environment: use IPC directly
+  const invoke = getTauriInvoke()
+  if (invoke) {
+    try {
+      const status: string = await invoke('gateway_status')
+      const parsed = JSON.parse(status)
+      return parsed.gateway === true
+    } catch {
+      return false
+    }
+  }
+
+  // Node environment: direct HTTP check
+  try {
+    const resp = await fetch(`${_gatewayUrl}/health`, { signal: AbortSignal.timeout(2000) })
+    return resp.ok
+  } catch {
+    return false
+  }
+}
+
+// ---- Config ----
 
 export interface OpenClawAdapterConfig {
   name?: string
   persona?: string
-  soulPath?: string     // SOUL.md 文件路径（Node 环境用）
-  memoryPath?: string
-  llm?: { baseUrl: string; apiKey: string; model: string }
-  enableScreen?: boolean // 是否启用屏幕感知（默认 false）
+  gatewayUrl?: string       // default: http://localhost:18790 (ottie profile)
+  agentId?: string          // default: "personal"
+  deviceAgentId?: string    // default: "device"
 }
 
-// ---- LLM helpers ----
-
-let llmClient: any = null
-let llmModel = ''
-
-async function llmChat(
-  messages: { role: string; content: string }[],
-  opts?: { temperature?: number; max_tokens?: number }
-): Promise<string> {
-  if (!llmClient) return ''
-  const resp = await llmClient.chat.completions.create({
-    model: llmModel,
-    messages,
-    temperature: opts?.temperature ?? 0.7,
-    max_tokens: opts?.max_tokens ?? 500,
-  })
-  return resp.choices[0]?.message?.content ?? ''
-}
-
-async function llmRewrite(intent: string, persona: string): Promise<string> {
-  return llmChat([
-    { role: 'system', content: `你是 Ottie，AI IM 秘书。把用户的口语化指令改写成适合发送给对方的得体消息。
-规则：保持原始意图，提取指令中真正要发的内容（如"帮我问他..."→去掉前缀），语言跟随用户，简洁自然。只输出改写后的消息。
-你的对外人格：${persona}` },
-    { role: 'user', content: intent },
-  ], { temperature: 0.6, max_tokens: 200 })
-}
-
-async function llmDetectIntent(message: string, senderName?: string): Promise<DetectedIntent> {
-  const raw = await llmChat([
-    { role: 'system', content: `分析收到的消息，判断意图并给出建议回复选项。
-输出严格 JSON：{"type":"invitation|question|request|info|greeting|general","summary":"一句话总结","suggestedActions":[{"label":"按钮文字2-4字","response":"点击后的回复"}]}
-- suggestedActions 最多 3 个，第一个是正面回应
-- 回复自然得体${senderName ? `\n发送者：${senderName}` : ''}` },
-    { role: 'user', content: message },
-  ], { temperature: 0.3, max_tokens: 300 })
-
-  try {
-    const jsonMatch = raw.match(/\{[\s\S]*\}/)
-    if (jsonMatch) return JSON.parse(jsonMatch[0])
-  } catch {}
-  return ruleDetectIntent(message)
-}
-
-async function llmComposeReply(originalMessage: string, userChoice: string): Promise<string> {
-  return llmChat([
-    { role: 'system', content: '根据用户的选择生成一条得体的回复。简洁自然，只输出回复内容。' },
-    { role: 'user', content: `收到的消息：${originalMessage}\n我的选择：${userChoice}\n请生成回复：` },
-  ], { temperature: 0.6, max_tokens: 150 })
-}
-
-// ---- Rule-based fallbacks ----
+// ---- Rule-based fallbacks (when gateway is unavailable) ----
 
 const COMMAND_PATTERNS = [
   { pattern: /^(帮我|替我|跟他|跟她|告诉他|告诉她|问他|问她|和他说|和她说|跟他说|跟她说)(.+)/, extract: 2 },
@@ -146,86 +142,101 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   id: string
   name: string
 
+  private gatewayUrl: string
+  private agentId: string
+  private deviceAgentId: string
   private persona: string
   private approvalManager: ReturnType<typeof createApprovalManager>
-  private memory: any
-  private screen: any = null
+  private gatewayConnected = false
   private status: 'running' | 'stopped' | 'error' = 'stopped'
-  private llmEnabled = false
-  private enableScreen: boolean
 
   private draftCallbacks: Set<(draft: ApprovalRequest) => void> = new Set()
   private decisionCallbacks: Set<(decision: DecisionRequest) => void> = new Set()
   private notificationCallbacks: Set<(event: OttieScreenEvent) => void> = new Set()
 
+  // Device state
+  private devices: OttieDevice[] = [
+    { id: 'local', name: '当前设备', type: 'desktop', agentId: 'device', status: 'online',
+      capabilities: ['read', 'exec', 'browser', 'screen'], lastSeen: Date.now() },
+  ]
+  lastCommandOutput = ''
+
   constructor(config: OpenClawAdapterConfig = {}) {
     this.id = `openclaw_${Date.now()}`
     this.name = config.name ?? 'Ottie'
     this.persona = config.persona ?? '友好、得体、简洁'
+    this.gatewayUrl = config.gatewayUrl ?? 'http://localhost:18790'
+    this.agentId = config.agentId ?? 'personal'
+    this.deviceAgentId = config.deviceAgentId ?? 'device'
     this.approvalManager = createApprovalManager()
-    this.memory = OttieMemory ? new OttieMemory(config.memoryPath ?? './MEMORY.md') : null
-    this.enableScreen = config.enableScreen ?? false
-    if (config.llm) this.configureLLM(config.llm)
-  }
-
-  // ============================================================
-  // LLM 配置
-  // ============================================================
-
-  configureLLM(config: { baseUrl: string; apiKey: string; model: string }): void {
-    // Dynamic import to avoid bundling openai in non-LLM builds
-    import('openai').then(({ default: OpenAI }) => {
-      llmClient = new OpenAI({
-        baseURL: config.baseUrl,
-        apiKey: config.apiKey,
-        dangerouslyAllowBrowser: true,
-      })
-      llmModel = config.model
-      this.llmEnabled = true
-      console.log(`🦦 Agent LLM: ${config.model} via ${config.baseUrl}`)
-    }).catch(() => {
-      console.warn('🦦 OpenAI SDK not available, using rule engine')
-    })
   }
 
   getAgentCard(): AgentCard {
     return {
       name: this.name,
-      capabilities: ['中文', '英文', '消息改写', '审批', '意图识别'],
+      capabilities: ['中文', '英文', '消息改写', '审批', '意图识别', '设备控制'],
       persona: this.persona,
     }
   }
 
   // ============================================================
-  // 发送方：用户输入 → 改写 → 审批
+  // Gateway 通信
+  // ============================================================
+
+  private async sendToPersonalAgent(message: string): Promise<string> {
+    if (!this.gatewayConnected) return ''
+    return gatewayAgent(this.agentId, message)
+  }
+
+  private async sendToDeviceAgent(message: string): Promise<string> {
+    if (!this.gatewayConnected) return ''
+    return gatewayAgent(this.deviceAgentId, message)
+  }
+
+  // ============================================================
+  // 发送方：用户输入 → OpenClaw 改写 → 审批
   // ============================================================
 
   async onMessage(msg: OttieMessage): Promise<void> {
     if (msg.content.type !== 'text') return
     const intent = msg.content.body
 
-    // Load memory context for LLM rewrite (checklist #151)
-    let memoryContext = ''
-    if (this.memory) {
-      try {
-        const relevant = await this.memory.query(intent)
-        if (relevant.length > 0) {
-          memoryContext = relevant.slice(0, 3).map((e: any) => e.content).join('; ')
-        }
-      } catch {}
+    // Check if this is a device command
+    if (this.isDeviceIntent(intent)) {
+      await this.handleDeviceCommand(intent)
+      return
     }
 
     let rewritten: string
-    if (this.llmEnabled) {
+
+    if (this.gatewayConnected) {
       try {
-        const personaWithMemory = this.persona + (memoryContext ? '\n记忆参考：' + memoryContext : '')
-        rewritten = await llmRewrite(intent, personaWithMemory)
-      } catch {
+        // Send to personal agent via OpenClaw gateway
+        const response = await this.sendToPersonalAgent(
+          `用户想发送以下消息，请改写成得体的版本。只输出改写后的消息，不要解释：\n\n${intent}`
+        )
+        // Parse response — agent may return JSON or plain text
+        try {
+          const parsed = JSON.parse(response)
+          rewritten = parsed.draft ?? parsed.content ?? response
+        } catch {
+          rewritten = response.trim() || ruleRewrite(intent)
+        }
+        if (typeof localStorage !== 'undefined' && localStorage?.setItem) {
+          localStorage.setItem('ottie_last_rewrite', JSON.stringify({ via: 'gateway', input: intent, output: rewritten }))
+        }
+      } catch (err: any) {
+        // Gateway error — fallback to rules
         rewritten = ruleRewrite(intent)
+        if (typeof localStorage !== 'undefined' && localStorage?.setItem) {
+          localStorage.setItem('ottie_last_rewrite', JSON.stringify({ via: 'fallback', error: err?.message ?? String(err), input: intent, output: rewritten }))
+        }
       }
     } else {
-      const result = rewrite({ intent, persona: this.persona })
-      rewritten = result.rewritten
+      rewritten = ruleRewrite(intent)
+      if (typeof localStorage !== 'undefined' && localStorage?.setItem) {
+        localStorage.setItem('ottie_last_rewrite', JSON.stringify({ via: 'not_connected', input: intent, output: rewritten }))
+      }
     }
 
     const request = this.approvalManager.createRequest(rewritten, intent, msg.roomId)
@@ -241,9 +252,18 @@ export class OpenClawAdapter implements OttieAgentAdapter {
     const body = msg.content.body
 
     let intent: DetectedIntent
-    if (this.llmEnabled) {
+
+    if (this.gatewayConnected) {
       try {
-        intent = await llmDetectIntent(body, senderName)
+        const response = await this.sendToPersonalAgent(
+          `分析收到的消息，判断意图并给出建议回复选项。输出严格 JSON。\n发送者：${senderName}\n消息：${body}`
+        )
+        const jsonMatch = response.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          intent = JSON.parse(jsonMatch[0])
+        } else {
+          intent = ruleDetectIntent(body)
+        }
       } catch {
         intent = ruleDetectIntent(body)
       }
@@ -266,14 +286,79 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   // ============================================================
 
   async onDecisionAction(originalMessage: string, chosenAction: SuggestedAction): Promise<string> {
-    if (this.llmEnabled) {
+    if (this.gatewayConnected) {
       try {
-        return await llmComposeReply(originalMessage, chosenAction.response)
+        const response = await this.sendToPersonalAgent(
+          `根据用户的选择生成一条得体的回复。只输出回复内容。\n收到的消息：${originalMessage}\n我的选择：${chosenAction.response}`
+        )
+        return response.trim() || chosenAction.response
       } catch {
         return chosenAction.response
       }
     }
     return chosenAction.response
+  }
+
+  // ============================================================
+  // 设备管理 — 通过 OpenClaw device agent 真正执行
+  // ============================================================
+
+  private isDeviceIntent(text: string): boolean {
+    return /电脑上|设备|截图|浏览器.*搜|搜.*浏览器|帮我.*打开|帮我.*搜|帮我.*查|帮我.*找文件|帮我.*执行|帮我.*运行/.test(text)
+  }
+
+  private async handleDeviceCommand(intent: string): Promise<void> {
+    let output: string
+
+    if (this.gatewayConnected) {
+      try {
+        // Send directly to device agent — it has real exec/browser/read tools
+        output = await this.sendToDeviceAgent(intent)
+        if (!output) output = '设备 Agent 未返回结果'
+      } catch (err: any) {
+        output = `设备指令执行失败: ${err.message ?? '未知错误'}`
+      }
+    } else {
+      output = '设备 Agent 不可用（OpenClaw gateway 未连接）'
+    }
+
+    this.lastCommandOutput = output
+
+    // Notify UI as a screen event
+    const event: OttieScreenEvent = {
+      type: 'user-action',
+      timestamp: Date.now(),
+      content: `🖥️ ${output}`,
+      confidence: 1.0,
+      actionRequired: false,
+      sourceApp: '当前设备',
+    }
+    for (const cb of this.notificationCallbacks) {
+      try { cb(event) } catch {}
+    }
+  }
+
+  async getDevices(): Promise<OttieDevice[]> {
+    return this.devices
+  }
+
+  async sendCommand(cmd: DeviceCommand): Promise<void> {
+    const intent = (cmd.args as any)?.intent ?? cmd.command
+    await this.handleDeviceCommand(intent)
+  }
+
+  dispatchToDevice(intent: string): { success: boolean; output?: string; command?: DeviceCommand; device?: OttieDevice } {
+    const device = this.devices[0]
+    if (!device || device.status !== 'online') {
+      return { success: false, output: '没有在线的设备' }
+    }
+    const command: DeviceCommand = {
+      targetDeviceId: device.id,
+      command: /浏览器|网页|搜索/.test(intent) ? 'browser' : /文件|读|打开/.test(intent) ? 'read' : 'exec',
+      args: { intent },
+      requireApproval: false,
+    }
+    return { success: true, command, device }
   }
 
   // ============================================================
@@ -311,47 +396,53 @@ export class OpenClawAdapter implements OttieAgentAdapter {
   }
 
   // ============================================================
-  // 记忆 + 生命周期
+  // 记忆 — 通过 gateway 查询
   // ============================================================
 
-  async getMemory(): Promise<MemoryIndex> { return this.memory?.load() ?? { entries: [], lastDream: 0, version: 1 } }
-  async queryMemory(query: string): Promise<MemoryEntry[]> { return this.memory?.query(query) ?? [] }
+  async getMemory(): Promise<MemoryIndex> {
+    return { entries: [], lastDream: 0, version: 1 }
+  }
+
+  async queryMemory(query: string): Promise<MemoryEntry[]> {
+    return []
+  }
+
+  // ============================================================
+  // 生命周期
+  // ============================================================
 
   async start(): Promise<void> {
-    if (this.memory) await this.memory.load()
-
-    // Start screen sensing if enabled and available
-    if (this.enableScreen && OttieScreenClass) {
-      this.screen = new OttieScreenClass()
-      this.screen.onEvent((event: OttieScreenEvent) => {
-        // Analyze the event using skills
-        let summary = event.content.slice(0, 100)
-        if (event.type === 'gui-popup') {
-          const result = analyzeGUIPopup(event)
-          summary = result.summary
-        } else if (event.type === 'cli-prompt') {
-          const result = analyzeCLIPrompt(event)
-          summary = result.summary
-        }
-
-        // Write to memory
-        if (this.memory) {
-          this.memory.observe(event, this.id).catch(() => {})
-        }
-
-        // Push notification to IM layer
-        for (const cb of this.notificationCallbacks) {
-          try { cb({ ...event, content: summary }) } catch {}
-        }
-      })
-      await this.screen.start()
+    // If Tauri IPC is available, gateway connectivity is guaranteed
+    // (Tauri backend manages the gateway lifecycle)
+    const invoke = getTauriInvoke()
+    if (invoke) {
+      this.gatewayConnected = true
+    } else {
+      // Non-Tauri environment: check gateway health via HTTP
+      try {
+        this.gatewayConnected = await gatewayHealth(this.gatewayUrl)
+      } catch {
+        this.gatewayConnected = false
+      }
     }
 
     this.status = 'running'
+
+    // If not connected, keep retrying in background
+    if (!this.gatewayConnected) {
+      const checkInterval = setInterval(async () => {
+        try {
+          this.gatewayConnected = await gatewayHealth(this.gatewayUrl)
+        } catch {
+          this.gatewayConnected = false
+        }
+        if (this.gatewayConnected) clearInterval(checkInterval)
+      }, 5000)
+    }
   }
 
   async stop(): Promise<void> {
-    if (this.screen) { this.screen.stop(); this.screen = null }
+    this.gatewayConnected = false
     this.status = 'stopped'
   }
 

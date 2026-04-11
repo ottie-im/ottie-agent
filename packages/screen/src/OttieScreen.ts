@@ -62,10 +62,8 @@ export class OttieScreen {
   async start(): Promise<void> {
     const ok = await this.isAvailable()
     if (!ok) {
-      console.log('🦦 Screen: Screenpipe not running, screen sensing disabled')
       return
     }
-    console.log('🦦 Screen: Screenpipe connected, polling every', this.pollInterval, 'ms')
 
     this.timer = setInterval(() => this.poll(), this.pollInterval)
   }

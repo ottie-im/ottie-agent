@@ -99,7 +99,7 @@ function testAdapterContract(name: string, createAdapter: () => OttieAgentAdapte
 }
 
 // 测试两种实现都满足接口
-testAdapterContract('OpenClawAdapter', () => new OpenClawAdapter({ memoryPath: '/tmp/ottie-test-memory.md' }))
+testAdapterContract('OpenClawAdapter', () => new OpenClawAdapter({ gatewayUrl: 'http://localhost:18789' }))
 testAdapterContract('MockAdapter', () => new MockAdapter())
 
 // OpenClaw 特有的改写测试
@@ -107,7 +107,7 @@ describe('OpenClawAdapter — 改写能力', () => {
   let adapter: OpenClawAdapter
 
   beforeEach(async () => {
-    adapter = new OpenClawAdapter({ memoryPath: '/tmp/ottie-test-memory.md' })
+    adapter = new OpenClawAdapter({ gatewayUrl: 'http://localhost:18789' })
     await adapter.start()
   })
 

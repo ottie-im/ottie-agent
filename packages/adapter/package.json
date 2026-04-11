@@ -5,6 +5,7 @@
   "dependencies": {
     "@ottie-im/contracts": "file:../../../ottie/packages/contracts",
     "@ottie-im/skills": "*",
+    "@ottie-im/mc-core": "*",
     "@ottie-im/memory": "*",
     "@ottie-im/screen": "*",
     "openai": "^4.80.0"

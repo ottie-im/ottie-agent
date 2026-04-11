@@ -2,5 +2,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+.turbo/
+.DS_Store
 data/personal/MEMORY.md
 data/device/MEMORY.md

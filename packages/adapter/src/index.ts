@@ -1,3 +1,5 @@
 export { OpenClawAdapter } from './OpenClawAdapter'
 export type { OpenClawAdapterConfig } from './OpenClawAdapter'
+export { MissionControlAdapter } from './MissionControlAdapter'
+export type { MissionControlAdapterConfig } from './MissionControlAdapter'
 export { MockAdapter } from './MockAdapter'
