@@ -51,6 +51,10 @@ import { dispatch, selectDevice, parseCommand } from '@ottie-im/skills'
 // LLM 直连
 import { OttieLLM, PROVIDERS } from '@ottie-im/llm'
 
+// Paseo 设备执行层
+import { OttiePaseo } from '@ottie-im/paseo'
+import type { PaseoStatusSnapshot } from '@ottie-im/paseo'
+
 // MC Core
 import {
   eventBus,
@@ -152,6 +156,12 @@ export interface MissionControlAdapterConfig {
     model?: string
     baseUrl?: string
   }
+  // Paseo 设备执行层
+  paseo?: {
+    daemonUrl?: string
+    defaultProvider?: 'claude' | 'codex' | 'copilot' | 'opencode' | 'pi'
+    defaultCwd?: string
+  }
 }
 
 // ---- Adapter ----
@@ -176,6 +186,9 @@ export class MissionControlAdapter implements OttieAgentAdapter {
 
   // LLM 直连
   private llm: OttieLLM | null = null
+
+  // Paseo 设备执行层
+  private paseo: OttiePaseo | null = null
 
   // MC Core
   private taskTracker: TaskTracker
@@ -230,6 +243,14 @@ export class MissionControlAdapter implements OttieAgentAdapter {
       }
       if (llmProvider) this.llm = new OttieLLM(llmProvider)
     }
+
+    // Paseo init（自动发现 daemon，不依赖 gateway）
+    this.paseo = new OttiePaseo({
+      daemonUrl: config.paseo?.daemonUrl,
+      defaultProvider: config.paseo?.defaultProvider as any,
+      defaultCwd: config.paseo?.defaultCwd,
+      clientId: `ottie_${Date.now()}`,
+    })
 
     // MC Core init
     this.taskTracker = new TaskTracker()
@@ -576,12 +597,18 @@ export class MissionControlAdapter implements OttieAgentAdapter {
 
         let output: string
         try {
-          // 直接尝试调用设备 Agent（不依赖 gatewayConnected 标志）
-          output = await gatewayAgent(this.deviceAgentId, deviceTask.intent)
-          if (!output) output = await gatewayAgent('main', deviceTask.intent)
-          if (!output) output = '设备 Agent 未返回结果'
+          if (this.paseo?.isReady()) {
+            // Paseo 优先：通过 daemon 执行
+            const result = await this.paseo.executeCommand(deviceTask.intent)
+            output = result.success ? result.output : `执行失败: ${result.output}`
+          } else {
+            // Fallback: OpenClaw gateway
+            output = await gatewayAgent(this.deviceAgentId, deviceTask.intent)
+            if (!output) output = await gatewayAgent('main', deviceTask.intent)
+            if (!output) output = '设备 Agent 未返回结果'
+          }
         } catch (err: any) {
-          // fallback: 尝试用 main agent
+          // 二级 fallback: 尝试用 main agent
           try {
             output = await gatewayAgent('main', deviceTask.intent)
           } catch (err2: any) {
@@ -646,11 +673,48 @@ export class MissionControlAdapter implements OttieAgentAdapter {
   // ============================================================
 
   async getDevices(): Promise<OttieDevice[]> {
-    return this.devices
+    const base = [...this.devices]
+    if (this.paseo?.isReady()) {
+      try {
+        const agents = this.paseo.getAgents()
+        for (const agent of agents) {
+          base.push({
+            id: `paseo_${agent.id}`,
+            name: `Agent ${agent.provider}`,
+            type: 'desktop',
+            agentId: agent.id,
+            status: ['idle', 'running'].includes(agent.status) ? 'online' : 'offline',
+            lastSeen: agent.createdAt,
+            capabilities: ['exec', 'read', 'write', 'browser'],
+          })
+        }
+      } catch {}
+    }
+    return base
   }
 
   async sendCommand(cmd: DeviceCommand): Promise<void> {
     const intent = (cmd.args as any)?.intent ?? cmd.command
+
+    // 设备房间直接操作（不走审批流程）
+    if (!cmd.requireApproval) {
+      let output: string
+      try {
+        if (this.paseo?.isReady()) {
+          const result = await this.paseo.executeCommand(intent)
+          output = result.success ? result.output : `执行失败: ${result.output}`
+        } else {
+          output = await gatewayAgent(this.deviceAgentId, intent)
+          if (!output) output = await gatewayAgent('main', intent)
+          if (!output) output = '设备 Agent 未返回结果'
+        }
+      } catch (err: any) {
+        output = `执行失败: ${err.message ?? '未知错误'}`
+      }
+      this.emitNotification(`🖥️ ${output}`, 'user-action')
+      return
+    }
+
     await this.handleDeviceCommand(intent, '', '')
   }
 
@@ -702,6 +766,7 @@ export class MissionControlAdapter implements OttieAgentAdapter {
   getTrustScore(): TrustScoreManager { return this.trustScore }
   getDelegateManager(): DelegateManager { return this.delegateManager }
   getDutyManager(): DutyManager { return this.dutyManager }
+  getPaseo(): OttiePaseo | null { return this.paseo }
 
   /** 动态配置 LLM（从设置页面调用） */
   configureLLM(config: { baseUrl: string; apiKey: string; model: string }): void {
@@ -716,6 +781,11 @@ export class MissionControlAdapter implements OttieAgentAdapter {
     // 检查 gateway（Tauri 环境也要实际检测，不盲目设 true）
     try { this.gatewayConnected = await gatewayHealth(this.gatewayUrl) }
     catch { this.gatewayConnected = false }
+
+    // Paseo 自动发现 + 连接
+    if (this.paseo) {
+      await this.paseo.start()
+    }
 
     this.status = 'running'
     eventBus.broadcast('agent.started', { id: this.id, name: this.name })
@@ -741,6 +811,7 @@ export class MissionControlAdapter implements OttieAgentAdapter {
   }
 
   async stop(): Promise<void> {
+    if (this.paseo) this.paseo.stop()
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null }
     if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
     this.gatewayConnected = false

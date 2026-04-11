@@ -7,6 +7,7 @@
     "@ottie-im/skills": "*",
     "@ottie-im/mc-core": "*",
     "@ottie-im/memory": "*",
+    "@ottie-im/paseo": "*",
     "@ottie-im/screen": "*",
     "openai": "^4.80.0"
   },
