@@ -1,15 +1,11 @@
 /**
- * OttiePaseo — 连接本地 Paseo daemon 的轻量级 bridge
+ * OttiePaseo — 设备 agent 管理层
  *
- * 使用原生 WebSocket + fetch 直接通信（不导入 @getpaseo/server，
- * 因为它包含 Node.js native 依赖，无法在 Vite/浏览器环境中打包）。
+ * 通过 Tauri commands 直接管理 agent 进程（claude / codex CLI），
+ * 不依赖外部 daemon 或 Node.js 运行时。
  *
- * 模式参考 OttieScreen：
- * - constructor 接收配置 + 设默认值
- * - isAvailable() 健康检查
- * - start() / stop() 生命周期
- * - 事件回调 + Unsubscribe
- * - 服务不可用时静默降级
+ * Tauri 环境：invoke('create_agent') → Rust spawn CLI → stdout 流式 emit
+ * 非 Tauri 环境：graceful 降级，isReady() 返回 false
  */
 
 import type { Unsubscribe } from '@ottie-im/contracts'
@@ -22,174 +18,135 @@ import type {
   PaseoStatusSnapshot,
 } from './types'
 
-/** Paseo WebSocket protocol version */
-const PROTOCOL_VERSION = 1
+// ---- Tauri IPC helpers ----
 
-/** Generate unique request ID */
-function reqId(): string {
-  return `ottie_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+function getTauriInvoke(): ((cmd: string, args?: any) => Promise<any>) | null {
+  if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {
+    return (window as any).__TAURI_INTERNALS__.invoke
+  }
+  return null
 }
 
+async function tauriListen(event: string, handler: (payload: any) => void): Promise<(() => void) | null> {
+  try {
+    // 动态 import — 仅在 Tauri 环境下可用
+    const mod = await (Function('return import("@tauri-apps/api/event")')() as Promise<any>)
+    const unlisten = await mod.listen(event, (e: any) => handler(e.payload))
+    return unlisten
+  } catch {
+    return null
+  }
+}
+
+// ---- Main class ----
+
 export class OttiePaseo {
-  // Config
-  private wsUrl: string
-  private httpUrl: string
-  private clientId: string
   private defaultProvider: PaseoProvider
   private defaultCwd: string
-  private reconnectInterval: number
 
-  // State
-  private ws: WebSocket | null = null
   private daemonStatus: PaseoDaemonStatus = 'disconnected'
   private agents: Map<string, PaseoAgentInfo> = new Map()
   private statusCallbacks: Set<(s: PaseoStatusSnapshot) => void> = new Set()
-  private reconnectTimer: ReturnType<typeof setInterval> | null = null
-  private daemonVersion: string | undefined
-
-  // 请求-响应映射（requestId → resolve callback）
-  private pendingRequests: Map<string, {
-    resolve: (data: any) => void
-    reject: (err: Error) => void
-    timer: ReturnType<typeof setTimeout>
-  }> = new Map()
-
-  // 流式事件监听器
   private eventListeners: Set<(event: any) => void> = new Set()
 
+  private unlistenStream: (() => void) | null = null
+  private unlistenUpdate: (() => void) | null = null
+
+  private availableProviders: string[] = []
+
   constructor(config: OttiePaseoConfig = {}) {
-    const httpBase = config.httpUrl ?? config.daemonUrl ?? 'http://localhost:6767'
-    this.httpUrl = httpBase.replace(/^ws/, 'http')
-    this.wsUrl = (config.daemonUrl ?? httpBase).replace(/^http/, 'ws')
-    this.clientId = config.clientId ?? 'ottie'
     this.defaultProvider = config.defaultProvider ?? 'claude'
     this.defaultCwd = config.defaultCwd ?? '/'
-    this.reconnectInterval = config.reconnectInterval ?? 10000
   }
 
   // ============================================================
-  // 健康检查
+  // 健康检查 — 检测 Tauri 环境 + 可用 provider
   // ============================================================
 
   async isAvailable(): Promise<boolean> {
+    const invoke = getTauriInvoke()
+    if (!invoke) return false
     try {
-      const resp = await fetch(`${this.httpUrl}/api/health`, {
-        signal: AbortSignal.timeout(3000),
-      })
-      if (!resp.ok) return false
-      const data = await resp.json()
-      return data.status === 'ok'
+      const providers: any[] = await invoke('detect_providers')
+      this.availableProviders = providers.filter((p: any) => p.available).map((p: any) => p.id)
+      return this.availableProviders.length > 0
     } catch {
       return false
     }
   }
 
   // ============================================================
-  // WebSocket 连接
+  // 连接 = 注册 Tauri event listeners
   // ============================================================
 
   async connect(): Promise<boolean> {
-    if (this.daemonStatus === 'connected' && this.ws) return true
+    const invoke = getTauriInvoke()
+    if (!invoke) {
+      this.daemonStatus = 'error'
+      this.emitStatus()
+      return false
+    }
 
     this.daemonStatus = 'connecting'
     this.emitStatus()
 
-    return new Promise<boolean>((resolve) => {
-      try {
-        const ws = new WebSocket(`${this.wsUrl}/ws`)
-        let settled = false
-
-        const timeout = setTimeout(() => {
-          if (!settled) {
-            settled = true
-            ws.close()
-            this.daemonStatus = 'error'
-            this.emitStatus()
-            resolve(false)
-          }
-        }, 10000)
-
-        ws.onopen = () => {
-          // 发送 hello 握手
-          ws.send(JSON.stringify({
-            type: 'hello',
-            clientId: this.clientId,
-            clientType: 'browser',
-            protocolVersion: PROTOCOL_VERSION,
-          }))
-        }
-
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data as string)
-            this.handleMessage(data)
-
-            // 首次收到 server_info 表示握手成功
-            if (!settled && data.type === 'session' && data.message?.type === 'status'
-              && data.message?.payload?.status === 'server_info') {
-              settled = true
-              clearTimeout(timeout)
-              this.ws = ws
-              this.daemonStatus = 'connected'
-              this.daemonVersion = data.message.payload.version
-              this.emitStatus()
-              // 拉取 agent 列表
-              this.refreshAgents().catch(() => {})
-              resolve(true)
-            }
-          } catch {}
-        }
-
-        ws.onclose = () => {
-          if (!settled) {
-            settled = true
-            clearTimeout(timeout)
-            this.daemonStatus = 'error'
-            this.emitStatus()
-            resolve(false)
-          } else {
-            this.ws = null
-            this.daemonStatus = 'disconnected'
-            this.agents.clear()
-            // reject 所有 pending requests
-            for (const [id, req] of this.pendingRequests) {
-              clearTimeout(req.timer)
-              req.reject(new Error('WebSocket closed'))
-            }
-            this.pendingRequests.clear()
-            this.emitStatus()
-          }
-        }
-
-        ws.onerror = () => {
-          if (!settled) {
-            settled = true
-            clearTimeout(timeout)
-            this.daemonStatus = 'error'
-            this.emitStatus()
-            resolve(false)
-          }
-        }
-      } catch {
-        this.daemonStatus = 'error'
-        this.emitStatus()
-        resolve(false)
+    // 注册 agent-stream 事件
+    this.unlistenStream = await tauriListen('agent-stream', (payload: any) => {
+      for (const listener of this.eventListeners) {
+        try {
+          listener({
+            type: 'agent_stream',
+            agentId: payload.agentId,
+            event: payload.event,
+          })
+        } catch {}
       }
     })
+
+    // 注册 agent-update 事件
+    this.unlistenUpdate = await tauriListen('agent-update', (payload: any) => {
+      const agentId = payload.agentId
+      const status = payload.status
+
+      // 更新本地 agent 状态
+      if (agentId) {
+        const existing = this.agents.get(agentId)
+        if (existing) {
+          existing.status = status
+          if (payload.output) existing.title = payload.output.slice(0, 100)
+        }
+        this.emitStatus()
+      }
+
+      // 通知 listeners
+      for (const listener of this.eventListeners) {
+        try {
+          listener({
+            type: 'agent_update',
+            agentId,
+            status,
+            output: payload.output ?? '',
+            provider: payload.provider,
+          })
+        } catch {}
+      }
+    })
+
+    // 拉取当前 agent 列表
+    await this.refreshAgents()
+
+    this.daemonStatus = 'connected'
+    this.emitStatus()
+    return true
   }
 
   async disconnect(): Promise<void> {
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
-    }
+    this.unlistenStream?.()
+    this.unlistenStream = null
+    this.unlistenUpdate?.()
+    this.unlistenUpdate = null
     this.agents.clear()
     this.daemonStatus = 'disconnected'
-    for (const [, req] of this.pendingRequests) {
-      clearTimeout(req.timer)
-      req.reject(new Error('Disconnected'))
-    }
-    this.pendingRequests.clear()
     this.emitStatus()
   }
 
@@ -201,129 +158,19 @@ export class OttiePaseo {
     const available = await this.isAvailable()
     if (available) {
       await this.connect()
+    } else {
+      // Tauri IPC 可能还没就绪，延迟重试
+      setTimeout(async () => {
+        if (this.daemonStatus !== 'connected') {
+          const retry = await this.isAvailable()
+          if (retry) await this.connect()
+        }
+      }, 3000)
     }
-    this.startReconnectPolling()
   }
 
   stop(): void {
-    this.stopReconnectPolling()
     this.disconnect()
-  }
-
-  // ============================================================
-  // WebSocket 消息处理
-  // ============================================================
-
-  private send(message: any): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-    this.ws.send(JSON.stringify(message))
-  }
-
-  /** 发送 session 消息并等待响应 */
-  private sendRequest(message: any, timeoutMs = 60000): Promise<any> {
-    return new Promise((resolve, reject) => {
-      const requestId = message.requestId
-      const timer = setTimeout(() => {
-        this.pendingRequests.delete(requestId)
-        reject(new Error('Request timeout'))
-      }, timeoutMs)
-
-      this.pendingRequests.set(requestId, { resolve, reject, timer })
-      this.send({ type: 'session', message })
-    })
-  }
-
-  private handleMessage(data: any): void {
-    if (data.type === 'session' && data.message) {
-      const msg = data.message
-
-      // 检查是否是 pending request 的响应
-      // requestId 可能在 msg.payload.requestId 或 msg.requestId
-      const respRequestId = msg.payload?.requestId ?? msg.requestId
-      if (respRequestId) {
-        const pending = this.pendingRequests.get(respRequestId)
-        if (pending) {
-          clearTimeout(pending.timer)
-          this.pendingRequests.delete(respRequestId)
-          pending.resolve(msg)
-          return
-        }
-      }
-
-      // agent_stream — Paseo 的主要事件通道
-      // 格式: msg.payload.agentId, msg.payload.event.type
-      if (msg.type === 'agent_stream') {
-        const agentId = msg.payload?.agentId
-        const streamEvent = msg.payload?.event
-        const event = {
-          type: 'agent_stream' as const,
-          agentId,
-          streamType: streamEvent?.type, // timeline, turn_started, turn_completed, attention_required
-          event: streamEvent,
-          payload: msg.payload,
-        }
-
-        // 更新本地 agent 状态
-        this.handleAgentEvent(event)
-
-        // 通知 listeners
-        for (const listener of this.eventListeners) {
-          try { listener(event) } catch {}
-        }
-      }
-
-      // agent_update — 部分 Paseo 版本可能使用
-      if (msg.type === 'agent_update') {
-        const event = {
-          type: 'agent_update' as const,
-          agentId: msg.agentId ?? msg.payload?.id,
-          payload: msg.payload,
-        }
-        this.handleAgentEvent(event)
-        for (const listener of this.eventListeners) {
-          try { listener(event) } catch {}
-        }
-      }
-
-      // status 消息
-      if (msg.type === 'status' && msg.payload?.version) {
-        this.daemonVersion = msg.payload.version
-      }
-
-      // agent_deleted / agent_archived
-      if (msg.type === 'agent_deleted' || msg.type === 'agent_archived') {
-        const agentId = msg.payload?.agentId ?? msg.agentId
-        if (agentId) {
-          this.agents.delete(agentId)
-          this.emitStatus()
-        }
-      }
-    }
-  }
-
-  private handleAgentEvent(event: any): void {
-    const agentId = event.agentId
-    if (!agentId) return
-
-    if (event.type === 'agent_update' && event.payload) {
-      const existing = this.agents.get(agentId)
-      if (existing) {
-        existing.status = event.payload.status ?? existing.status
-        existing.title = event.payload.title ?? existing.title
-      } else {
-        this.agents.set(agentId, {
-          id: agentId,
-          provider: (event.payload.provider ?? event.payload.type ?? 'claude') as PaseoProvider,
-          status: event.payload.status ?? 'idle',
-          title: event.payload.title ?? null,
-          cwd: event.payload.cwd ?? '',
-          createdAt: event.payload.createdAt
-            ? new Date(event.payload.createdAt).getTime()
-            : Date.now(),
-        })
-      }
-      this.emitStatus()
-    }
   }
 
   // ============================================================
@@ -336,54 +183,30 @@ export class OttiePaseo {
     initialPrompt?: string
     title?: string
   }): Promise<string | null> {
-    if (!this.isReady()) return null
-    const requestId = reqId()
-    const provider = options?.provider ?? this.defaultProvider
+    const invoke = getTauriInvoke()
+    if (!invoke || !this.isReady()) return null
 
+    const provider = options?.provider ?? this.defaultProvider
     try {
-      const resp = await this.sendRequest({
-        type: 'create_agent_request',
-        requestId,
-        config: {
-          provider,
-          cwd: options?.cwd ?? this.defaultCwd,
-        },
-        ...(options?.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
+      const agentId: string = await invoke('create_agent', {
+        provider,
+        cwd: options?.cwd ?? this.defaultCwd,
+        prompt: options?.initialPrompt ?? '',
       })
 
-      // agent_created 响应: msg.payload.agent 或 msg.payload 本身
-      const agent = resp?.payload?.agent ?? resp?.payload
-      const agentId = agent?.id
-      if (agentId) {
-        this.agents.set(agentId, {
-          id: agentId,
-          provider: (agent.provider ?? agent.type ?? provider) as PaseoProvider,
-          status: agent.status ?? 'initializing',
-          title: agent.title ?? options?.title ?? null,
-          cwd: agent.cwd ?? options?.cwd ?? this.defaultCwd,
-          createdAt: agent.createdAt ? new Date(agent.createdAt).getTime() : Date.now(),
-        })
-        this.emitStatus()
-        return agentId
-      }
-      return null
+      this.agents.set(agentId, {
+        id: agentId,
+        provider,
+        status: 'running',
+        title: options?.title ?? null,
+        cwd: options?.cwd ?? this.defaultCwd,
+        createdAt: Date.now(),
+      })
+      this.emitStatus()
+      return agentId
     } catch {
       return null
     }
-  }
-
-  async sendToAgent(agentId: string, message: string): Promise<void> {
-    if (!this.isReady()) return
-    const requestId = reqId()
-    this.send({
-      type: 'session',
-      message: {
-        type: 'send_agent_message',
-        agentId,
-        text: message,
-        requestId,
-      },
-    })
   }
 
   getAgents(): PaseoAgentInfo[] {
@@ -391,31 +214,21 @@ export class OttiePaseo {
   }
 
   async refreshAgents(): Promise<PaseoAgentInfo[]> {
-    if (!this.isReady()) return []
-    const requestId = reqId()
+    const invoke = getTauriInvoke()
+    if (!invoke) return []
 
     try {
-      const resp = await this.sendRequest({
-        type: 'fetch_agents_request',
-        requestId,
-        sort: [{ key: 'updated_at', direction: 'desc' as const }],
-        page: { limit: 50 },
-      }, 10000)
-
+      const entries: any[] = await invoke('list_agents')
       this.agents.clear()
-      const entries = resp?.payload?.entries ?? resp?.entries ?? []
-      for (const entry of entries) {
-        const agent = entry.agent ?? entry
-        if (agent?.id) {
-          this.agents.set(agent.id, {
-            id: agent.id,
-            provider: (agent.provider ?? agent.type ?? 'claude') as PaseoProvider,
-            status: agent.status ?? 'idle',
-            title: agent.title ?? null,
-            cwd: agent.cwd ?? '',
-            createdAt: agent.createdAt ? new Date(agent.createdAt).getTime() : Date.now(),
-          })
-        }
+      for (const e of entries) {
+        this.agents.set(e.id, {
+          id: e.id,
+          provider: e.provider as PaseoProvider,
+          status: e.status,
+          title: e.output?.slice(0, 100) ?? null,
+          cwd: e.cwd,
+          createdAt: (e.created_at ?? 0) * 1000,
+        })
       }
       this.emitStatus()
       return this.getAgents()
@@ -425,27 +238,9 @@ export class OttiePaseo {
   }
 
   async cancelAgent(agentId: string): Promise<void> {
-    if (!this.isReady()) return
-    this.send({
-      type: 'session',
-      message: {
-        type: 'cancel_agent_request',
-        agentId,
-        requestId: reqId(),
-      },
-    })
-  }
-
-  async archiveAgent(agentId: string): Promise<void> {
-    if (!this.isReady()) return
-    this.send({
-      type: 'session',
-      message: {
-        type: 'archive_agent_request',
-        agentId,
-        requestId: reqId(),
-      },
-    })
+    const invoke = getTauriInvoke()
+    if (!invoke) return
+    try { await invoke('cancel_agent', { agentId }) } catch {}
   }
 
   // ============================================================
@@ -464,7 +259,6 @@ export class OttiePaseo {
       return { success: false, output: '设备 Agent 未连接', agentId: '', provider }
     }
 
-    // 创建新 agent，intent 作为 initialPrompt
     const agentId = await this.createAgent({
       provider,
       cwd: options?.cwd ?? this.defaultCwd,
@@ -475,10 +269,8 @@ export class OttiePaseo {
       return { success: false, output: '无法创建 Agent', agentId: '', provider }
     }
 
-    // 等待 agent 完成（idle/error/closed）
+    // 等待 agent-update 事件
     return new Promise<PaseoExecResult>((resolve) => {
-      let lastOutput = ''
-
       const timeout = setTimeout(() => {
         this.eventListeners.delete(listener)
         this.cancelAgent(agentId).catch(() => {})
@@ -486,57 +278,19 @@ export class OttiePaseo {
       }, timeoutMs)
 
       const listener = (event: any) => {
+        if (event.type !== 'agent_update') return
         if (event.agentId !== agentId) return
 
-        if (event.type === 'agent_stream') {
-          const streamEvt = event.event
-          // 收集 assistant_message 输出和 shell 命令输出
-          if (streamEvt?.type === 'timeline') {
-            const item = streamEvt.item
-            if (item?.type === 'assistant_message' && item.text) {
-              lastOutput += item.text
-            }
-            if (item?.type === 'tool_call' && item.detail?.output) {
-              lastOutput += item.detail.output
-            }
-          }
-          // 完成标志：attention_required + reason: finished
-          if (streamEvt?.type === 'attention_required' && streamEvt?.reason === 'finished') {
-            clearTimeout(timeout)
-            this.eventListeners.delete(listener)
-            resolve({
-              success: true,
-              output: lastOutput.trim() || '执行完成',
-              agentId,
-              provider,
-            })
-          }
-          // 错误标志
-          if (streamEvt?.type === 'attention_required' && streamEvt?.reason === 'error') {
-            clearTimeout(timeout)
-            this.eventListeners.delete(listener)
-            resolve({
-              success: false,
-              output: lastOutput.trim() || '执行出错',
-              agentId,
-              provider,
-            })
-          }
-        }
-
-        // 兼容 agent_update 格式
-        if (event.type === 'agent_update') {
-          const status = event.payload?.status
-          if (status === 'idle' || status === 'error' || status === 'closed') {
-            clearTimeout(timeout)
-            this.eventListeners.delete(listener)
-            resolve({
-              success: status === 'idle',
-              output: lastOutput.trim() || event.payload?.lastError || '执行完成',
-              agentId,
-              provider,
-            })
-          }
+        const status = event.status
+        if (status === 'idle' || status === 'error' || status === 'cancelled') {
+          clearTimeout(timeout)
+          this.eventListeners.delete(listener)
+          resolve({
+            success: status === 'idle',
+            output: event.output || '执行完成',
+            agentId,
+            provider,
+          })
         }
       }
 
@@ -557,7 +311,7 @@ export class OttiePaseo {
     return {
       daemonStatus: this.daemonStatus,
       agents: this.getAgents(),
-      daemonVersion: this.daemonVersion,
+      availableProviders: this.availableProviders,
     }
   }
 
@@ -566,7 +320,11 @@ export class OttiePaseo {
   }
 
   isReady(): boolean {
-    return this.daemonStatus === 'connected' && this.ws !== null
+    return this.daemonStatus === 'connected'
+  }
+
+  getAvailableProviders(): string[] {
+    return this.availableProviders
   }
 
   // ============================================================
@@ -577,24 +335,6 @@ export class OttiePaseo {
     const snapshot = this.getStatus()
     for (const cb of this.statusCallbacks) {
       try { cb(snapshot) } catch {}
-    }
-  }
-
-  private startReconnectPolling(): void {
-    if (this.reconnectTimer) return
-    this.reconnectTimer = setInterval(async () => {
-      if (this.isReady()) return
-      const available = await this.isAvailable()
-      if (available && !this.isReady()) {
-        await this.connect()
-      }
-    }, this.reconnectInterval)
-  }
-
-  private stopReconnectPolling(): void {
-    if (this.reconnectTimer) {
-      clearInterval(this.reconnectTimer)
-      this.reconnectTimer = null
     }
   }
 }

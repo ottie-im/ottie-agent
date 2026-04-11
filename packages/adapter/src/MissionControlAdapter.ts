@@ -51,9 +51,8 @@ import { dispatch, selectDevice, parseCommand } from '@ottie-im/skills'
 // LLM 直连
 import { OttieLLM, PROVIDERS } from '@ottie-im/llm'
 
-// Paseo 设备执行层
+// 设备执行层
 import { OttiePaseo } from '@ottie-im/paseo'
-import type { PaseoStatusSnapshot } from '@ottie-im/paseo'
 
 // MC Core
 import {
@@ -156,10 +155,9 @@ export interface MissionControlAdapterConfig {
     model?: string
     baseUrl?: string
   }
-  // Paseo 设备执行层
+  // 设备执行层
   paseo?: {
-    daemonUrl?: string
-    defaultProvider?: 'claude' | 'codex' | 'copilot' | 'opencode' | 'pi'
+    defaultProvider?: 'claude' | 'codex'
     defaultCwd?: string
   }
 }
@@ -244,12 +242,10 @@ export class MissionControlAdapter implements OttieAgentAdapter {
       if (llmProvider) this.llm = new OttieLLM(llmProvider)
     }
 
-    // Paseo init（自动发现 daemon，不依赖 gateway）
+    // 设备 agent 管理层
     this.paseo = new OttiePaseo({
-      daemonUrl: config.paseo?.daemonUrl,
       defaultProvider: config.paseo?.defaultProvider as any,
       defaultCwd: config.paseo?.defaultCwd,
-      clientId: `ottie_${Date.now()}`,
     })
 
     // MC Core init
